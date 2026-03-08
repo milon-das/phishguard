@@ -310,8 +310,6 @@ class URLExpander {
 
       // Create HTTP client that doesn't automatically follow redirects
       final client = HttpClient();
-      client.badCertificateCallback =
-          (X509Certificate cert, String host, int port) => true;
 
       String currentUrl = cleanUrl;
       int redirectCount = 0;
@@ -2629,7 +2627,7 @@ class _ScanQRPageState extends State<ScanQRPage> {
                                   fontWeight: FontWeight.bold,
                                 ),
                               ),
-                              if (confidence > 0)
+                              if (confidence > 0 && methodUsed == 'ML Model')
                                 Text(
                                   '${(confidence * 100).toStringAsFixed(1)}% confidence',
                                   style: const TextStyle(

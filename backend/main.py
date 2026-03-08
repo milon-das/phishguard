@@ -7,7 +7,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 import requests
 import os
-import sys
 import joblib
 import scipy.sparse as sp
 from typing import Optional
@@ -16,8 +15,7 @@ from collections import deque
 import threading
 import asyncio
 
-# Add src directory to path for imports
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), 'src'))
+# url_features.py lives alongside main.py in the backend/ folder
 from url_features import extract_features_batch
 
 app = FastAPI(title="PhishGuard API", version="1.0.0", docs_url=None, redoc_url=None, openapi_url=None)
