@@ -6,10 +6,55 @@ import 'package:http/http.dart' as http;
 import 'dart:convert';
 import 'dart:io';
 import 'dart:async';
-import 'dart:ui' show FontFeature;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:intl/intl.dart';
 import 'package:app_links/app_links.dart';
+import 'package:mobile_scanner/mobile_scanner.dart';
+
+/// Resilient HTTP client for PhishGuard backend requests.
+///
+/// Automatically retries up to 3 times with exponential backoff on transient
+/// failures (5xx errors, timeouts). Never retries [SocketException] (no
+/// network) or 4xx responses (client errors).
+class BackendClient {
+  static const int _maxAttempts = 3;
+  static const List<Duration> _backoff = [
+    Duration(seconds: 3),
+    Duration(seconds: 7),
+  ];
+
+  static Future<http.Response> postWithRetry({
+    required String url,
+    required Map<String, dynamic> body,
+    Duration timeout = const Duration(seconds: 45),
+    void Function(int attempt, String msg)? onRetry,
+  }) async {
+    for (int i = 0; i < _maxAttempts; i++) {
+      if (i > 0) {
+        await Future.delayed(_backoff[i - 1]);
+        onRetry?.call(i + 1, 'Retrying... (${i + 1}/$_maxAttempts)');
+      }
+      try {
+        final response = await http
+            .post(
+              Uri.parse(url),
+              headers: {'Content-Type': 'application/json'},
+              body: json.encode(body),
+            )
+            .timeout(timeout);
+        // 4xx — client error, don't retry
+        if (response.statusCode < 500) return response;
+        // 5xx — retry unless this is the last attempt
+        if (i == _maxAttempts - 1) return response;
+      } on SocketException {
+        rethrow; // No network — surface immediately
+      } on TimeoutException {
+        if (i == _maxAttempts - 1) rethrow;
+      }
+    }
+    throw Exception('Request failed after $_maxAttempts attempts');
+  }
+}
 
 // History Item Model
 class HistoryItem {
@@ -544,7 +589,14 @@ class PhishGuardHomePage extends StatelessWidget {
                 icon: Icons.qr_code_scanner,
                 title: 'Scan QR Code',
                 subtitle: 'Detect malicious QR payloads',
-                onTap: () {},
+                onTap: () {
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (context) => const ScanQRPage(),
+                    ),
+                  );
+                },
               ),
               const SizedBox(height: 16),
               _buildFeatureButton(
@@ -2076,106 +2128,6 @@ class _SettingsPageState extends State<SettingsPage> {
                     ),
                     const SizedBox(height: 24),
 
-                    // Backend URL Info Section
-                    Container(
-                      width: double.infinity,
-                      padding: const EdgeInsets.all(20),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFF2a3346),
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                      child: Column(
-                        crossAxisAlignment: CrossAxisAlignment.start,
-                        children: [
-                          Row(
-                            children: [
-                              Container(
-                                padding: const EdgeInsets.all(8),
-                                decoration: BoxDecoration(
-                                  color: Colors.green.withOpacity(0.15),
-                                  borderRadius: BorderRadius.circular(6),
-                                ),
-                                child: const Icon(
-                                  Icons.cloud_done,
-                                  color: Colors.green,
-                                  size: 24,
-                                ),
-                              ),
-                              const SizedBox(width: 12),
-                              const Text(
-                                'Backend Status',
-                                style: TextStyle(
-                                  color: Colors.white,
-                                  fontSize: 18,
-                                  fontWeight: FontWeight.w600,
-                                ),
-                              ),
-                            ],
-                          ),
-                          const SizedBox(height: 12),
-                          const Text(
-                            'ML backend is permanently hosted on Render.com',
-                            style: TextStyle(
-                              color: Colors.white70,
-                              fontSize: 13,
-                            ),
-                          ),
-                          const SizedBox(height: 16),
-                          Container(
-                            padding: const EdgeInsets.all(14),
-                            decoration: BoxDecoration(
-                              color: Colors.green.withOpacity(0.08),
-                              border: Border.all(
-                                  color: Colors.green.withOpacity(0.4)),
-                              borderRadius: BorderRadius.circular(8),
-                            ),
-                            child: Row(
-                              children: [
-                                const Icon(Icons.check_circle,
-                                    color: Colors.green, size: 20),
-                                const SizedBox(width: 10),
-                                const Expanded(
-                                  child: Text(
-                                    'phishguard-ml-backend.onrender.com',
-                                    style: TextStyle(
-                                      color: Colors.green,
-                                      fontSize: 13,
-                                      fontWeight: FontWeight.w500,
-                                    ),
-                                    overflow: TextOverflow.ellipsis,
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                          const SizedBox(height: 10),
-                          Container(
-                            padding: const EdgeInsets.all(12),
-                            decoration: BoxDecoration(
-                              color: Colors.blue.withOpacity(0.08),
-                              borderRadius: BorderRadius.circular(6),
-                            ),
-                            child: Row(
-                              crossAxisAlignment: CrossAxisAlignment.start,
-                              children: [
-                                Icon(Icons.info_outline,
-                                    color: Colors.blue[300], size: 16),
-                                const SizedBox(width: 8),
-                                Expanded(
-                                  child: Text(
-                                    'Backend is live 24/7 on Render.com. No configuration needed.',
-                                    style: TextStyle(
-                                        color: Colors.blue[200], fontSize: 12),
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                    const SizedBox(height: 24),
-
                     // About PhishGuard Section
                     Container(
                       width: double.infinity,
@@ -2234,143 +2186,571 @@ class _SettingsPageState extends State<SettingsPage> {
   }
 }
 
-// Rate Limit Dialog with Countdown
-class RateLimitDialog extends StatefulWidget {
-  final int secondsUntilReset;
-
-  const RateLimitDialog({super.key, required this.secondsUntilReset});
+// QR Scan Page
+class ScanQRPage extends StatefulWidget {
+  const ScanQRPage({super.key});
 
   @override
-  State<RateLimitDialog> createState() => _RateLimitDialogState();
+  State<ScanQRPage> createState() => _ScanQRPageState();
 }
 
-class _RateLimitDialogState extends State<RateLimitDialog> {
-  late int _remainingSeconds;
-  Timer? _timer;
+class _ScanQRPageState extends State<ScanQRPage> {
+  final MobileScannerController _controller = MobileScannerController();
+  String? _scannedText;
+  bool _scannedIsUrl = false;
+  bool _isChecking = false;
+  String _checkStatusMsg = 'Analyzing URL...';
+  Map<String, dynamic>? _checkResult;
+  bool _usedCache = false;
 
-  @override
-  void initState() {
-    super.initState();
-    _remainingSeconds = widget.secondsUntilReset;
-
-    // Start countdown timer
-    _timer = Timer.periodic(const Duration(seconds: 1), (timer) {
-      setState(() {
-        _remainingSeconds--;
-        if (_remainingSeconds <= 0) {
-          timer.cancel();
-          Navigator.of(context).pop(); // Auto-close when reset
-        }
-      });
-    });
-  }
+  static const String _backendUrl =
+      'https://phishguard-ml-backend.onrender.com';
 
   @override
   void dispose() {
-    _timer?.cancel();
+    _controller.dispose();
     super.dispose();
+  }
+
+  void _handleDetection(BarcodeCapture capture) {
+    if (_scannedText != null) return;
+    final barcodes = capture.barcodes;
+    if (barcodes.isEmpty) return;
+    final value = barcodes.first.rawValue?.trim();
+    if (value == null || value.isEmpty) return;
+
+    _controller.stop();
+    final isUrl = value.startsWith('http://') || value.startsWith('https://');
+    setState(() {
+      _scannedText = value;
+      _scannedIsUrl = isUrl;
+    });
+  }
+
+  Color _verdictColor(String verdict) {
+    switch (verdict) {
+      case 'Safe':
+        return Colors.green;
+      case 'Malicious':
+        return Colors.red;
+      case 'Suspicious':
+        return Colors.orange;
+      default:
+        return Colors.grey;
+    }
+  }
+
+  IconData _verdictIcon(String verdict) {
+    switch (verdict) {
+      case 'Safe':
+        return Icons.check_circle;
+      case 'Malicious':
+        return Icons.dangerous;
+      case 'Suspicious':
+        return Icons.warning;
+      default:
+        return Icons.help_outline;
+    }
+  }
+
+  Future<void> _runCheck() async {
+    final url = _scannedText!;
+
+    if (url.length > 2048) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('URL is too long (max 2048 characters)'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+      return;
+    }
+
+    setState(() {
+      _isChecking = true;
+      _checkResult = null;
+      _usedCache = false;
+      _checkStatusMsg = 'Analyzing URL...';
+    });
+
+    try {
+      // Check cache first
+      final cached = await HistoryManager.getCachedResult(url, 'QR');
+      if (cached != null && mounted) {
+        setState(() {
+          _checkResult = cached.fullData ?? {};
+          _isChecking = false;
+          _usedCache = true;
+        });
+        return;
+      }
+
+      final prefs = await SharedPreferences.getInstance();
+      final vtApiKey = prefs.getString('virustotal_api_key');
+      final Map<String, dynamic> requestBody = {'url': url};
+      if (vtApiKey != null && vtApiKey.isNotEmpty) {
+        requestBody['vt_api_key'] = vtApiKey;
+      }
+
+      final response = await BackendClient.postWithRetry(
+        url: '$_backendUrl/check-url',
+        body: requestBody,
+        onRetry: (attempt, msg) {
+          if (mounted) setState(() => _checkStatusMsg = msg);
+        },
+      );
+
+      if (!mounted) return;
+
+      if (response.statusCode == 200) {
+        final result = json.decode(response.body) as Map<String, dynamic>;
+        final methodUsed = result['method_used'] as String?;
+        final cacheDuration = (methodUsed == 'VirusTotal')
+            ? const Duration(hours: 8)
+            : const Duration(minutes: 30);
+
+        await HistoryManager.saveHistoryItem(HistoryItem(
+          id: DateTime.now().millisecondsSinceEpoch.toString(),
+          type: 'QR',
+          name: url,
+          verdict: result['verdict'] ?? 'Unknown',
+          detectionStats: result['details'] ?? 'No details available',
+          timestamp: DateTime.now(),
+          cacheUntil: DateTime.now().add(cacheDuration),
+          fullData: result,
+        ));
+
+        setState(() {
+          _checkResult = result;
+          _isChecking = false;
+        });
+      } else {
+        throw Exception('Backend returned ${response.statusCode}');
+      }
+    } on SocketException {
+      if (mounted) {
+        setState(() => _isChecking = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('No internet connection. Please check your network.'),
+            backgroundColor: Colors.red,
+          ),
+        );
+      }
+    } on TimeoutException {
+      if (mounted) {
+        setState(() => _isChecking = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+                'Request timed out after 3 attempts. The server may be starting up — please try again.'),
+            backgroundColor: Colors.red,
+            duration: Duration(seconds: 5),
+          ),
+        );
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _isChecking = false);
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Error: ${e.toString()}'),
+            backgroundColor: Colors.red,
+            duration: const Duration(seconds: 5),
+          ),
+        );
+      }
+    }
   }
 
   @override
   Widget build(BuildContext context) {
-    final minutes = _remainingSeconds ~/ 60;
-    final seconds = _remainingSeconds % 60;
-
-    return AlertDialog(
-      backgroundColor: const Color(0xFF2a3346),
-      title: Row(
-        children: [
-          Icon(Icons.timer_off, color: Colors.orange, size: 28),
-          const SizedBox(width: 12),
-          const Text(
-            'Rate Limit Exceeded',
-            style: TextStyle(color: Colors.white),
-          ),
-        ],
+    return Scaffold(
+      backgroundColor: const Color(0xFF1a1d2e),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF2a3346),
+        title:
+            const Text('Scan QR Code', style: TextStyle(color: Colors.white)),
+        leading: IconButton(
+          icon: const Icon(Icons.arrow_back, color: Colors.white),
+          onPressed: () => Navigator.pop(context),
+        ),
       ),
-      content: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Container(
-            padding: const EdgeInsets.all(16),
-            decoration: BoxDecoration(
-              color: Colors.orange.withOpacity(0.2),
-              borderRadius: BorderRadius.circular(8),
-              border: Border.all(color: Colors.orange, width: 2),
-            ),
-            child: Column(
+      body: _scannedText != null ? _buildResultPage() : _buildScanner(),
+    );
+  }
+
+  Widget _buildScanner() {
+    return Stack(
+      children: [
+        MobileScanner(
+          controller: _controller,
+          onDetect: _handleDetection,
+        ),
+        Positioned.fill(
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Container(
+                width: 240,
+                height: 240,
+                decoration: BoxDecoration(
+                  border: Border.all(color: Colors.white70, width: 3),
+                  borderRadius: BorderRadius.circular(16),
+                ),
+              ),
+              const SizedBox(height: 24),
+              const Text(
+                'Point at a QR code to scan',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 16,
+                  shadows: [Shadow(color: Colors.black, blurRadius: 4)],
+                ),
+              ),
+            ],
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildResultPage() {
+    final verdict = _checkResult?['verdict'] as String?;
+    final confidence = (_checkResult?['confidence'] ?? 0.0) as double;
+    final methodUsed = _checkResult?['method_used'] as String?;
+    final details = _checkResult?['details'] as String? ?? '';
+
+    return SafeArea(
+      child: SingleChildScrollView(
+        padding: const EdgeInsets.all(20.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            // Header row
+            Row(
               children: [
-                Text(
-                  'VirusTotal API Limit',
-                  style: TextStyle(
+                Container(
+                  padding: const EdgeInsets.all(10),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF2a3346),
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: Icon(
+                    _scannedIsUrl ? Icons.link : Icons.qr_code_scanner,
                     color: Colors.white,
-                    fontSize: 16,
-                    fontWeight: FontWeight.w600,
+                    size: 28,
                   ),
                 ),
-                const SizedBox(height: 8),
-                Text(
-                  'Maximum 4 requests per minute',
-                  style: TextStyle(
-                    color: Colors.white70,
-                    fontSize: 14,
+                const SizedBox(width: 12),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        _scannedIsUrl ? 'URL Detected' : 'QR Code Content',
+                        style: const TextStyle(
+                          color: Colors.white,
+                          fontSize: 18,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                      Text(
+                        _scannedIsUrl
+                            ? 'Tap Check for Threats to analyse'
+                            : 'Plain text content',
+                        style: TextStyle(
+                          color: Colors.white.withOpacity(0.6),
+                          fontSize: 12,
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               ],
             ),
-          ),
-          const SizedBox(height: 24),
-          Text(
-            'Limit resets in:',
-            style: TextStyle(
-              color: Colors.white70,
-              fontSize: 14,
+
+            const SizedBox(height: 20),
+
+            // Content box with inline copy icon
+            Container(
+              width: double.infinity,
+              padding: const EdgeInsets.fromLTRB(14, 12, 6, 12),
+              decoration: BoxDecoration(
+                color: const Color(0xFF2a3346),
+                borderRadius: BorderRadius.circular(10),
+                border: Border.all(color: const Color(0xFF4a6c8e)),
+              ),
+              child: Row(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Expanded(
+                    child: SelectableText(
+                      _scannedText!,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 13,
+                      ),
+                    ),
+                  ),
+                  GestureDetector(
+                    onTap: () {
+                      Clipboard.setData(ClipboardData(text: _scannedText!));
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(
+                          content: Text('Copied to clipboard'),
+                          duration: Duration(seconds: 2),
+                        ),
+                      );
+                    },
+                    child: Container(
+                      padding: const EdgeInsets.all(6),
+                      margin: const EdgeInsets.only(left: 8),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF4a9eff).withOpacity(0.15),
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      child: const Icon(
+                        Icons.copy,
+                        color: Colors.white54,
+                        size: 18,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
             ),
-          ),
-          const SizedBox(height: 8),
-          Text(
-            '${minutes.toString().padLeft(2, '0')}:${seconds.toString().padLeft(2, '0')}',
-            style: TextStyle(
-              color: Colors.orange,
-              fontSize: 48,
-              fontWeight: FontWeight.bold,
-              fontFeatures: [FontFeature.tabularFigures()],
-            ),
-          ),
-          const SizedBox(height: 16),
-          Container(
-            padding: const EdgeInsets.all(12),
-            decoration: BoxDecoration(
-              color: const Color(0xFF1a1d2e),
-              borderRadius: BorderRadius.circular(8),
-            ),
-            child: Row(
-              children: [
-                Icon(Icons.lightbulb_outline, color: Colors.blue, size: 20),
-                const SizedBox(width: 8),
-                Expanded(
-                  child: Text(
-                    'ML Model will be used as fallback during rate limits',
-                    style: TextStyle(
-                      color: Colors.white70,
-                      fontSize: 12,
+
+            const SizedBox(height: 20),
+
+            // ── URL check area ──
+            if (_scannedIsUrl) ...[
+              if (_checkResult == null && !_isChecking)
+                SizedBox(
+                  width: double.infinity,
+                  child: ElevatedButton.icon(
+                    onPressed: _runCheck,
+                    icon: const Icon(Icons.security, size: 20),
+                    label: const Text(
+                      'Check for Threats',
+                      style:
+                          TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
+                    ),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: const Color(0xFF3d6b9e),
+                      foregroundColor: Colors.white,
+                      padding: const EdgeInsets.symmetric(vertical: 16),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                    ),
+                  ),
+                ),
+              if (_isChecking) ...[
+                const SizedBox(height: 8),
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(24),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF2a3346),
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: const Column(
+                    children: [
+                      CircularProgressIndicator(
+                        color: Color(0xFF4a9eff),
+                        strokeWidth: 3,
+                      ),
+                      SizedBox(height: 16),
+                      Text(
+                        'Analyzing URL...',
+                        style: TextStyle(color: Colors.white70, fontSize: 14),
+                      ),
+                      SizedBox(height: 4),
+                      Text(
+                        'Running VirusTotal & ML checks',
+                        style: TextStyle(color: Colors.white38, fontSize: 12),
+                      ),
+                    ],
+                  ),
+                ),
+              ],
+              if (_checkResult != null && verdict != null) ...[
+                // Cached badge
+                if (_usedCache)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: Row(
+                      children: [
+                        const Icon(Icons.history, color: Colors.blue, size: 14),
+                        const SizedBox(width: 4),
+                        Text(
+                          'Showing cached result',
+                          style: TextStyle(
+                              color: Colors.blue.shade300, fontSize: 12),
+                        ),
+                      ],
+                    ),
+                  ),
+
+                // Verdict card
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(20),
+                  decoration: BoxDecoration(
+                    color: _verdictColor(verdict).withOpacity(0.12),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(
+                      color: _verdictColor(verdict).withOpacity(0.5),
+                      width: 1.5,
+                    ),
+                  ),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Row(
+                        children: [
+                          Icon(
+                            _verdictIcon(verdict),
+                            color: _verdictColor(verdict),
+                            size: 32,
+                          ),
+                          const SizedBox(width: 12),
+                          Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                verdict,
+                                style: TextStyle(
+                                  color: _verdictColor(verdict),
+                                  fontSize: 22,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                              if (confidence > 0)
+                                Text(
+                                  '${(confidence * 100).toStringAsFixed(1)}% confidence',
+                                  style: const TextStyle(
+                                    color: Colors.white60,
+                                    fontSize: 13,
+                                  ),
+                                ),
+                            ],
+                          ),
+                        ],
+                      ),
+                      if (methodUsed != null) ...[
+                        const SizedBox(height: 14),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                              horizontal: 10, vertical: 4),
+                          decoration: BoxDecoration(
+                            color: Colors.white.withOpacity(0.08),
+                            borderRadius: BorderRadius.circular(6),
+                          ),
+                          child: Text(
+                            'Analysis: $methodUsed',
+                            style: const TextStyle(
+                              color: Colors.white70,
+                              fontSize: 12,
+                            ),
+                          ),
+                        ),
+                      ],
+                      if (details.isNotEmpty) ...[
+                        const SizedBox(height: 12),
+                        Text(
+                          details,
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 14,
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+
+                const SizedBox(height: 12),
+
+                // View Full Report
+                SizedBox(
+                  width: double.infinity,
+                  child: OutlinedButton.icon(
+                    onPressed: () {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (_) => URLResultsPage(
+                            url: _scannedText!,
+                            result: _checkResult!,
+                          ),
+                        ),
+                      );
+                    },
+                    icon: const Icon(Icons.open_in_new, size: 16),
+                    label: const Text('View Full Report'),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.white70,
+                      side: const BorderSide(color: Colors.white24),
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                    ),
+                  ),
+                ),
+
+                const SizedBox(height: 8),
+
+                // Re-check button
+                SizedBox(
+                  width: double.infinity,
+                  child: TextButton.icon(
+                    onPressed: _runCheck,
+                    icon: const Icon(Icons.refresh, size: 16),
+                    label: const Text('Re-check'),
+                    style: TextButton.styleFrom(
+                      foregroundColor: Colors.white38,
                     ),
                   ),
                 ),
               ],
+            ],
+
+            const SizedBox(height: 16),
+
+            // Scan Again
+            SizedBox(
+              width: double.infinity,
+              child: OutlinedButton.icon(
+                onPressed: () {
+                  setState(() {
+                    _scannedText = null;
+                    _scannedIsUrl = false;
+                    _checkResult = null;
+                    _isChecking = false;
+                    _usedCache = false;
+                  });
+                  _controller.start();
+                },
+                icon: const Icon(Icons.qr_code_scanner, size: 18),
+                label: const Text('Scan Again'),
+                style: OutlinedButton.styleFrom(
+                  foregroundColor: Colors.white54,
+                  side: const BorderSide(color: Colors.white24),
+                  padding: const EdgeInsets.symmetric(vertical: 12),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                ),
+              ),
             ),
-          ),
-        ],
-      ),
-      actions: [
-        TextButton(
-          onPressed: () => Navigator.of(context).pop(),
-          child: const Text(
-            'OK',
-            style: TextStyle(color: Color(0xFF4a9eff)),
-          ),
+          ],
         ),
-      ],
+      ),
     );
   }
 }
@@ -2388,6 +2768,7 @@ class CheckURLPage extends StatefulWidget {
 class _CheckURLPageState extends State<CheckURLPage> {
   final TextEditingController _urlController = TextEditingController();
   bool _isChecking = false;
+  String _checkStatusMsg = 'Checking URL...';
   final String _backendUrl = 'https://phishguard-ml-backend.onrender.com';
 
   @override
@@ -2475,15 +2856,6 @@ class _CheckURLPageState extends State<CheckURLPage> {
     }
   }
 
-  void _showRateLimitDialog(int secondsUntilReset) {
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) =>
-          RateLimitDialog(secondsUntilReset: secondsUntilReset),
-    );
-  }
-
   Future<void> _checkUrl() async {
     final url = _urlController.text.trim();
 
@@ -2521,6 +2893,7 @@ class _CheckURLPageState extends State<CheckURLPage> {
 
     setState(() {
       _isChecking = true;
+      _checkStatusMsg = 'Checking URL...';
     });
 
     try {
@@ -2572,79 +2945,18 @@ class _CheckURLPageState extends State<CheckURLPage> {
       final prefs = await SharedPreferences.getInstance();
       final vtApiKey = prefs.getString('virustotal_api_key');
 
-      // Check rate limit status before scanning
-      try {
-        final rateLimitResponse = await http
-            .get(
-              Uri.parse('$_backendUrl/rate-limit-status'),
-            )
-            .timeout(const Duration(seconds: 5));
-
-        if (rateLimitResponse.statusCode == 200) {
-          final rateLimitData = json.decode(rateLimitResponse.body);
-          final isRateLimited = rateLimitData['rate_limited'] as bool;
-          final secondsUntilReset = rateLimitData['seconds_until_reset'] as int;
-          final requestsRemaining = rateLimitData['requests_remaining'] as int;
-
-          if (isRateLimited) {
-            // Show informational snackbar but DON'T block the scan
-            // The backend will use ML model automatically
-            if (mounted) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(
-                  content: Row(
-                    children: [
-                      Icon(Icons.info_outline, color: Colors.white),
-                      SizedBox(width: 12),
-                      Expanded(
-                        child: Text(
-                          'VirusTotal rate limited. Using ML Model for analysis...',
-                        ),
-                      ),
-                    ],
-                  ),
-                  backgroundColor: Colors.orange,
-                  duration: const Duration(seconds: 4),
-                ),
-              );
-            }
-            // DON'T return - let the scan proceed with ML
-          } else if (requestsRemaining <= 1 && requestsRemaining > 0) {
-            // Warn if only 1 request left
-            if (mounted) {
-              ScaffoldMessenger.of(context).showSnackBar(
-                SnackBar(
-                  content: Text(
-                      '⚠️ Only $requestsRemaining VirusTotal request remaining this minute'),
-                  backgroundColor: Colors.orange,
-                  duration: const Duration(seconds: 3),
-                ),
-              );
-            }
-          }
-        }
-      } catch (e) {
-        print('[DEBUG] Could not check rate limit: $e');
-        // Continue with scan even if rate limit check fails
-      }
-
       // Prepare request body with URL and optional API key
       final Map<String, dynamic> requestBody = {'url': url};
       if (vtApiKey != null && vtApiKey.isNotEmpty) {
         requestBody['vt_api_key'] = vtApiKey;
       }
 
-      // Call FastAPI backend
-      final response = await http
-          .post(
-        Uri.parse('$_backendUrl/check-url'),
-        headers: {'Content-Type': 'application/json'},
-        body: json.encode(requestBody),
-      )
-          .timeout(
-        const Duration(seconds: 30),
-        onTimeout: () {
-          throw TimeoutException('Request timed out');
+      // Call FastAPI backend with automatic retry on transient failures
+      final response = await BackendClient.postWithRetry(
+        url: '$_backendUrl/check-url',
+        body: requestBody,
+        onRetry: (attempt, msg) {
+          if (mounted) setState(() => _checkStatusMsg = msg);
         },
       );
 
@@ -2692,6 +3004,19 @@ class _CheckURLPageState extends State<CheckURLPage> {
       } else {
         throw Exception('Failed to check URL: ${response.statusCode}');
       }
+    } on SocketException {
+      setState(() {
+        _isChecking = false;
+      });
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('No internet connection. Please check your network.'),
+            backgroundColor: Colors.red,
+            duration: Duration(seconds: 5),
+          ),
+        );
+      }
     } on TimeoutException {
       setState(() {
         _isChecking = false;
@@ -2700,9 +3025,9 @@ class _CheckURLPageState extends State<CheckURLPage> {
         ScaffoldMessenger.of(context).showSnackBar(
           const SnackBar(
             content: Text(
-                'Request timed out. Make sure the backend server is running.'),
+                'Request timed out after 3 attempts. The server may be starting up — please try again.'),
             backgroundColor: Colors.red,
-            duration: Duration(seconds: 5),
+            duration: Duration(seconds: 6),
           ),
         );
       }
@@ -2713,8 +3038,7 @@ class _CheckURLPageState extends State<CheckURLPage> {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text(
-                'Error: ${e.toString()}\n\nMake sure the FastAPI backend is running at $_backendUrl'),
+            content: Text('Error: ${e.toString()}'),
             backgroundColor: Colors.red,
             duration: const Duration(seconds: 6),
           ),
@@ -2772,7 +3096,7 @@ class _CheckURLPageState extends State<CheckURLPage> {
                     ),
                     const SizedBox(height: 8),
                     const Text(
-                      '1. VirusTotal API (80+ security vendors)\n2. ML Model (98.17% accuracy)',
+                      '1. VirusTotal API (80+ security vendors)\n2. ML Model Analysis',
                       style: TextStyle(
                         color: Colors.white,
                         fontSize: 14,
@@ -2842,10 +3166,10 @@ class _CheckURLPageState extends State<CheckURLPage> {
                     ),
                   ),
                   child: _isChecking
-                      ? const Row(
+                      ? Row(
                           mainAxisAlignment: MainAxisAlignment.center,
                           children: [
-                            SizedBox(
+                            const SizedBox(
                               width: 20,
                               height: 20,
                               child: CircularProgressIndicator(
@@ -2854,10 +3178,10 @@ class _CheckURLPageState extends State<CheckURLPage> {
                                     AlwaysStoppedAnimation<Color>(Colors.white),
                               ),
                             ),
-                            SizedBox(width: 12),
+                            const SizedBox(width: 12),
                             Text(
-                              'Checking URL...',
-                              style: TextStyle(
+                              _checkStatusMsg,
+                              style: const TextStyle(
                                 fontSize: 16,
                                 color: Colors.white,
                               ),
@@ -2924,18 +3248,13 @@ class _CheckURLPageState extends State<CheckURLPage> {
                 ),
                 child: Row(
                   children: [
-                    Icon(Icons.circle,
-                        size: 8,
-                        color:
-                            _backendUrl.isNotEmpty ? Colors.green : Colors.red),
+                    const Icon(Icons.circle, size: 8, color: Colors.green),
                     const SizedBox(width: 8),
-                    Expanded(
-                      child: Text(
-                        'Backend: $_backendUrl',
-                        style: TextStyle(
-                          color: Colors.white.withOpacity(0.7),
-                          fontSize: 12,
-                        ),
+                    const Text(
+                      'ML Protection Active',
+                      style: TextStyle(
+                        color: Colors.white70,
+                        fontSize: 12,
                       ),
                     ),
                   ],
@@ -3741,7 +4060,7 @@ class _ScanAttachmentPageState extends State<ScanAttachmentPage>
         headers: {
           'x-apikey': apiKey,
         },
-      );
+      ).timeout(const Duration(seconds: 30));
 
       setState(() {
         _isScanning = false;
@@ -3860,6 +4179,33 @@ class _ScanAttachmentPageState extends State<ScanAttachmentPage>
       } else {
         // Other error
         throw Exception('VirusTotal API error: ${response.statusCode}');
+      }
+    } on SocketException {
+      setState(() {
+        _isScanning = false;
+      });
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('No internet connection. Please check your network.'),
+            backgroundColor: Colors.red,
+            duration: Duration(seconds: 5),
+          ),
+        );
+      }
+    } on TimeoutException {
+      setState(() {
+        _isScanning = false;
+      });
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+                'Request timed out. VirusTotal may be slow, please try again.'),
+            backgroundColor: Colors.orange,
+            duration: Duration(seconds: 5),
+          ),
+        );
       }
     } catch (e) {
       setState(() {
@@ -3988,7 +4334,7 @@ class _ScanAttachmentPageState extends State<ScanAttachmentPage>
         headers: {
           'x-apikey': apiKey,
         },
-      );
+      ).timeout(const Duration(seconds: 30));
 
       setState(() {
         _isScanning = false;
@@ -4120,6 +4466,33 @@ class _ScanAttachmentPageState extends State<ScanAttachmentPage>
         // Other error
         throw Exception(
             'VirusTotal API error: ${response.statusCode} - ${response.body}');
+      }
+    } on SocketException {
+      setState(() {
+        _isScanning = false;
+      });
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text('No internet connection. Please check your network.'),
+            backgroundColor: Colors.red,
+            duration: Duration(seconds: 5),
+          ),
+        );
+      }
+    } on TimeoutException {
+      setState(() {
+        _isScanning = false;
+      });
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+                'Request timed out. VirusTotal may be slow, please try again.'),
+            backgroundColor: Colors.orange,
+            duration: Duration(seconds: 5),
+          ),
+        );
       }
     } catch (e) {
       setState(() {

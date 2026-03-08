@@ -14,6 +14,7 @@ from typing import Optional
 from datetime import datetime, timedelta
 from collections import deque
 import threading
+import asyncio
 
 # Add src directory to path for imports
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), 'src'))
@@ -56,6 +57,12 @@ print(f"Model: PhiUSIIL Phishing URL Dataset")
 print(f"Performance: 99.78% accuracy, 0.44% false positive rate")
 print(f"Training: 235,370 URLs (134,850 malicious, 100,520 benign)")
 print("=" * 80)
+
+# Concurrency guard
+# Render free tier: 512 MB RAM. After model load (~200 MB), each request
+# uses ~20-30 MB. Cap at 8 concurrent to stay safely under memory limit.
+_active_requests: int = 0
+_MAX_CONCURRENT: int = 8
 
 
 MAX_URL_LENGTH = 2048
@@ -131,11 +138,13 @@ def check_virustotal(url: str, api_key: Optional[str] = None):
     if not vt_key:
         return None
 
-    # Check rate limit before making request
-    if check_rate_limit():
-        return "RATE_LIMITED"
-
-    add_request_to_rate_limit()
+    # Only apply the global rate limiter when using the server's own shared key.
+    # Each user supplies their own key, which has its own independent VT quota.
+    using_server_key = not api_key
+    if using_server_key:
+        if check_rate_limit():
+            return "RATE_LIMITED"
+        add_request_to_rate_limit()
     
     headers = {
         "x-apikey": vt_key,
@@ -315,40 +324,60 @@ async def check_url(request: URLCheckRequest):
     Check URL using two-layer defense:
     1. VirusTotal API (primary)
     2. ML Model (secondary/fallback)
+
+    Blocking I/O and CPU work are offloaded to threads so the event loop
+    stays responsive under concurrent load. A concurrency cap protects
+    against OOM on the Render free tier (512 MB RAM).
     """
-    url = request.url  # already validated and stripped by pydantic
+    global _active_requests
 
-    # Layer 1: VirusTotal Check (PRIMARY)
-    vt_result = check_virustotal(url, request.vt_api_key)
+    # Shed excess load before we exhaust memory
+    if _active_requests >= _MAX_CONCURRENT:
+        raise HTTPException(
+            status_code=503,
+            detail="Server is busy. Please retry in a few seconds.",
+            headers={"Retry-After": "10"},
+        )
+    _active_requests += 1
 
-    is_rate_limited = (vt_result == "RATE_LIMITED")
-    if is_rate_limited:
-        vt_result = None
+    try:
+        url = request.url  # already validated and stripped by pydantic
 
-    # Layer 2: ML Model Check (fallback)
-    ml_result = None
-    should_use_ml = (
-        vt_result is None or
-        (isinstance(vt_result, dict) and vt_result.get('total', 0) == 0)
-    )
+        # Layer 1: VirusTotal Check (PRIMARY)
+        # run_in_executor keeps the async event loop unblocked during network I/O
+        vt_result = await asyncio.to_thread(check_virustotal, url, request.vt_api_key)
 
-    if should_use_ml:
-        ml_result = check_ml_model(url)
-        if vt_result and vt_result.get('total', 0) == 0:
+        is_rate_limited = (vt_result == "RATE_LIMITED")
+        if is_rate_limited:
             vt_result = None
 
-    # Determine final verdict
-    verdict, confidence, method, details = determine_verdict(vt_result, ml_result)
-    
-    return URLCheckResponse(
-        url=url,
-        verdict=verdict,
-        confidence=confidence,
-        vt_result=vt_result,
-        ml_result=ml_result,
-        method_used=method,
-        details=details
-    )
+        # Layer 2: ML Model Check (fallback)
+        # asyncio.to_thread also prevents CPU-bound inference from stalling other requests
+        ml_result = None
+        should_use_ml = (
+            vt_result is None or
+            (isinstance(vt_result, dict) and vt_result.get('total', 0) == 0)
+        )
+
+        if should_use_ml:
+            ml_result = await asyncio.to_thread(check_ml_model, url)
+            if vt_result and vt_result.get('total', 0) == 0:
+                vt_result = None
+
+        # Determine final verdict
+        verdict, confidence, method, details = determine_verdict(vt_result, ml_result)
+
+        return URLCheckResponse(
+            url=url,
+            verdict=verdict,
+            confidence=confidence,
+            vt_result=vt_result,
+            ml_result=ml_result,
+            method_used=method,
+            details=details,
+        )
+    finally:
+        _active_requests -= 1
 
 
 @app.get("/health")
@@ -360,35 +389,6 @@ async def health():
         "vt_api_configured": bool(VIRUSTOTAL_API_KEY)
     }
 
-
-@app.get("/rate-limit-status")
-async def rate_limit_status():
-    """Check current rate limit status"""
-    now = datetime.now()
-    
-    # Clean old requests
-    while rate_limit_requests and (now - rate_limit_requests[0]) > timedelta(seconds=RATE_LIMIT_WINDOW):
-        rate_limit_requests.popleft()
-    
-    requests_used = len(rate_limit_requests)
-    requests_remaining = max(0, RATE_LIMIT_MAX - requests_used)
-    is_limited = requests_used >= RATE_LIMIT_MAX
-    
-    # Calculate time until reset
-    seconds_until_reset = 0
-    if is_limited and rate_limit_requests:
-        oldest_request = rate_limit_requests[0]
-        reset_time = oldest_request + timedelta(seconds=RATE_LIMIT_WINDOW)
-        seconds_until_reset = max(0, int((reset_time - now).total_seconds()))
-    
-    return {
-        "rate_limited": is_limited,
-        "requests_used": requests_used,
-        "requests_remaining": requests_remaining,
-        "max_requests": RATE_LIMIT_MAX,
-        "window_seconds": RATE_LIMIT_WINDOW,
-        "seconds_until_reset": seconds_until_reset
-    }
 
 
 if __name__ == "__main__":
