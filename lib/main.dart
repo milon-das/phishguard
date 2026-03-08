@@ -1668,24 +1668,16 @@ class _SettingsPageState extends State<SettingsPage> {
   }
 
   Future<void> _loadBackendUrl() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final backendUrl = prefs.getString('backend_url') ??
-          'https://phishguard-ml-backend.onrender.com';
-
-      setState(() {
-        _backendUrlController.text = backendUrl;
-        _isBackendUrlConfigured = backendUrl.isNotEmpty;
-      });
-    } catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(
-            content: Text('Error loading backend URL: ${e.toString()}'),
-            backgroundColor: Colors.orange,
-          ),
-        );
-      }
+    // Auto-migrate any stale ngrok/localhost URL to the permanent Render URL
+    final prefs = await SharedPreferences.getInstance();
+    final saved = prefs.getString('backend_url') ?? '';
+    if (saved.isEmpty ||
+        saved.contains('ngrok') ||
+        saved.contains('localhost') ||
+        saved.contains('127.0.0.1') ||
+        saved.contains('10.0.2.2')) {
+      await prefs.setString(
+          'backend_url', 'https://phishguard-ml-backend.onrender.com');
     }
   }
 
@@ -2084,7 +2076,7 @@ class _SettingsPageState extends State<SettingsPage> {
                     ),
                     const SizedBox(height: 24),
 
-                    // Backend URL Configuration Section
+                    // Backend URL Info Section
                     Container(
                       width: double.infinity,
                       padding: const EdgeInsets.all(20),
@@ -2100,18 +2092,18 @@ class _SettingsPageState extends State<SettingsPage> {
                               Container(
                                 padding: const EdgeInsets.all(8),
                                 decoration: BoxDecoration(
-                                  color: Colors.white.withOpacity(0.1),
+                                  color: Colors.green.withOpacity(0.15),
                                   borderRadius: BorderRadius.circular(6),
                                 ),
                                 child: const Icon(
-                                  Icons.cloud,
-                                  color: Colors.white,
+                                  Icons.cloud_done,
+                                  color: Colors.green,
                                   size: 24,
                                 ),
                               ),
                               const SizedBox(width: 12),
                               const Text(
-                                'Backend Configuration',
+                                'Backend Status',
                                 style: TextStyle(
                                   color: Colors.white,
                                   fontSize: 18,
@@ -2122,173 +2114,58 @@ class _SettingsPageState extends State<SettingsPage> {
                           ),
                           const SizedBox(height: 12),
                           const Text(
-                            'Enter your backend URL (localhost or ngrok URL for remote access)',
+                            'ML backend is permanently hosted on Render.com',
                             style: TextStyle(
                               color: Colors.white70,
                               fontSize: 13,
                             ),
                           ),
-                          const SizedBox(height: 20),
-                          // Backend URL Input
+                          const SizedBox(height: 16),
                           Container(
+                            padding: const EdgeInsets.all(14),
                             decoration: BoxDecoration(
-                              color: const Color(0xFF1a1d2e),
+                              color: Colors.green.withOpacity(0.08),
+                              border: Border.all(
+                                  color: Colors.green.withOpacity(0.4)),
                               borderRadius: BorderRadius.circular(8),
                             ),
-                            padding: const EdgeInsets.symmetric(horizontal: 12),
                             child: Row(
                               children: [
-                                const Icon(
-                                  Icons.link,
-                                  color: Colors.white54,
-                                  size: 20,
-                                ),
-                                const SizedBox(width: 8),
-                                Expanded(
-                                  child: TextField(
-                                    controller: _backendUrlController,
-                                    style: const TextStyle(color: Colors.white),
-                                    decoration: const InputDecoration(
-                                      hintText:
-                                          'http://localhost:8000 or https://your-ngrok-url',
-                                      hintStyle: TextStyle(
-                                          color: Colors.white38, fontSize: 13),
-                                      border: InputBorder.none,
+                                const Icon(Icons.check_circle,
+                                    color: Colors.green, size: 20),
+                                const SizedBox(width: 10),
+                                const Expanded(
+                                  child: Text(
+                                    'phishguard-ml-backend.onrender.com',
+                                    style: TextStyle(
+                                      color: Colors.green,
+                                      fontSize: 13,
+                                      fontWeight: FontWeight.w500,
                                     ),
+                                    overflow: TextOverflow.ellipsis,
                                   ),
                                 ),
                               ],
                             ),
                           ),
-                          const SizedBox(height: 16),
-                          // Backend URL Configured Status
-                          if (_isBackendUrlConfigured)
-                            Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 16,
-                                vertical: 12,
-                              ),
-                              decoration: BoxDecoration(
-                                color: Colors.blue.withOpacity(0.1),
-                                border: Border.all(
-                                  color: Colors.blue,
-                                  width: 1,
-                                ),
-                                borderRadius: BorderRadius.circular(8),
-                              ),
-                              child: Row(
-                                children: [
-                                  Container(
-                                    padding: const EdgeInsets.all(4),
-                                    decoration: const BoxDecoration(
-                                      color: Colors.blue,
-                                      shape: BoxShape.circle,
-                                    ),
-                                    child: const Icon(
-                                      Icons.check,
-                                      color: Colors.white,
-                                      size: 16,
-                                    ),
-                                  ),
-                                  const SizedBox(width: 12),
-                                  Expanded(
-                                    child: Text(
-                                      'Backend: ${_backendUrlController.text}',
-                                      style: const TextStyle(
-                                        color: Colors.blue,
-                                        fontSize: 13,
-                                        fontWeight: FontWeight.w500,
-                                      ),
-                                      overflow: TextOverflow.ellipsis,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          const SizedBox(height: 16),
-                          // Save and Reset Buttons
-                          Row(
-                            children: [
-                              Expanded(
-                                child: ElevatedButton.icon(
-                                  onPressed: _saveBackendUrl,
-                                  icon: const Icon(
-                                    Icons.save,
-                                    color: Colors.white,
-                                    size: 18,
-                                  ),
-                                  label: const Text(
-                                    'Save URL',
-                                    style: TextStyle(
-                                      color: Colors.white,
-                                      fontSize: 14,
-                                      fontWeight: FontWeight.w600,
-                                    ),
-                                  ),
-                                  style: ElevatedButton.styleFrom(
-                                    backgroundColor: const Color(0xFF4a6c8e),
-                                    padding: const EdgeInsets.symmetric(
-                                      vertical: 12,
-                                    ),
-                                    shape: RoundedRectangleBorder(
-                                      borderRadius: BorderRadius.circular(8),
-                                    ),
-                                  ),
-                                ),
-                              ),
-                              const SizedBox(width: 12),
-                              ElevatedButton.icon(
-                                onPressed: _resetBackendUrl,
-                                icon: const Icon(
-                                  Icons.refresh,
-                                  color: Colors.white,
-                                  size: 18,
-                                ),
-                                label: const Text(
-                                  'Reset',
-                                  style: TextStyle(
-                                    color: Colors.white,
-                                    fontSize: 14,
-                                    fontWeight: FontWeight.w600,
-                                  ),
-                                ),
-                                style: ElevatedButton.styleFrom(
-                                  backgroundColor: Colors.orange,
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 20,
-                                    vertical: 12,
-                                  ),
-                                  shape: RoundedRectangleBorder(
-                                    borderRadius: BorderRadius.circular(8),
-                                  ),
-                                ),
-                              ),
-                            ],
-                          ),
-                          const SizedBox(height: 12),
-                          // Info text
+                          const SizedBox(height: 10),
                           Container(
                             padding: const EdgeInsets.all(12),
                             decoration: BoxDecoration(
-                              color: Colors.blue.withOpacity(0.1),
+                              color: Colors.blue.withOpacity(0.08),
                               borderRadius: BorderRadius.circular(6),
                             ),
                             child: Row(
                               crossAxisAlignment: CrossAxisAlignment.start,
                               children: [
-                                Icon(
-                                  Icons.info_outline,
-                                  color: Colors.blue[300],
-                                  size: 18,
-                                ),
+                                Icon(Icons.info_outline,
+                                    color: Colors.blue[300], size: 16),
                                 const SizedBox(width: 8),
                                 Expanded(
                                   child: Text(
-                                    'Use localhost for same device testing, or ngrok URL for remote access from other devices',
+                                    'Backend is live 24/7 on Render.com. No configuration needed.',
                                     style: TextStyle(
-                                      color: Colors.blue[200],
-                                      fontSize: 12,
-                                    ),
+                                        color: Colors.blue[200], fontSize: 12),
                                   ),
                                 ),
                               ],
@@ -2511,7 +2388,7 @@ class CheckURLPage extends StatefulWidget {
 class _CheckURLPageState extends State<CheckURLPage> {
   final TextEditingController _urlController = TextEditingController();
   bool _isChecking = false;
-  String _backendUrl = 'http://localhost:8000'; // Default backend URL
+  final String _backendUrl = 'https://phishguard-ml-backend.onrender.com';
 
   @override
   void initState() {
@@ -2585,10 +2462,17 @@ class _CheckURLPageState extends State<CheckURLPage> {
   }
 
   Future<void> _loadBackendUrl() async {
+    // Auto-migrate any stale ngrok/localhost URL to the permanent Render URL
     final prefs = await SharedPreferences.getInstance();
-    setState(() {
-      _backendUrl = prefs.getString('backend_url') ?? 'http://localhost:8000';
-    });
+    final saved = prefs.getString('backend_url') ?? '';
+    if (saved.isEmpty ||
+        saved.contains('ngrok') ||
+        saved.contains('localhost') ||
+        saved.contains('127.0.0.1') ||
+        saved.contains('10.0.2.2')) {
+      await prefs.setString(
+          'backend_url', 'https://phishguard-ml-backend.onrender.com');
+    }
   }
 
   void _showRateLimitDialog(int secondsUntilReset) {
@@ -2618,6 +2502,17 @@ class _CheckURLPageState extends State<CheckURLPage> {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text('URL must start with http:// or https://'),
+          backgroundColor: Colors.red,
+        ),
+      );
+      return;
+    }
+
+    // Prevent excessively long inputs
+    if (url.length > 2048) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('URL is too long (max 2048 characters)'),
           backgroundColor: Colors.red,
         ),
       );
@@ -2839,14 +2734,6 @@ class _CheckURLPageState extends State<CheckURLPage> {
           icon: const Icon(Icons.arrow_back, color: Colors.white),
           onPressed: () => Navigator.pop(context),
         ),
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.settings, color: Colors.white),
-            onPressed: () {
-              _showBackendSettings();
-            },
-          ),
-        ],
       ),
       body: SafeArea(
         child: SingleChildScrollView(
@@ -3081,77 +2968,55 @@ class _CheckURLPageState extends State<CheckURLPage> {
   }
 
   void _showBackendSettings() {
-    final TextEditingController backendController =
-        TextEditingController(text: _backendUrl);
-
     showDialog(
       context: context,
       builder: (context) => AlertDialog(
         backgroundColor: const Color(0xFF2a3346),
-        title: const Text(
-          'Backend Settings',
-          style: TextStyle(color: Colors.white),
+        title: const Row(
+          children: [
+            Icon(Icons.cloud_done, color: Colors.green),
+            SizedBox(width: 8),
+            Text('Backend Status', style: TextStyle(color: Colors.white)),
+          ],
         ),
         content: Column(
           mainAxisSize: MainAxisSize.min,
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
             const Text(
-              'Backend URL:',
+              'ML backend is live on Render.com:',
               style: TextStyle(color: Colors.white70, fontSize: 14),
             ),
-            const SizedBox(height: 8),
-            TextField(
-              controller: backendController,
-              style: const TextStyle(color: Colors.white),
-              decoration: InputDecoration(
-                hintText: 'http://localhost:8000',
-                hintStyle: TextStyle(color: Colors.white.withOpacity(0.5)),
-                filled: true,
-                fillColor: const Color(0xFF1a1d2e),
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(8),
-                  borderSide: BorderSide.none,
+            const SizedBox(height: 10),
+            Container(
+              padding: const EdgeInsets.all(12),
+              decoration: BoxDecoration(
+                color: Colors.green.withOpacity(0.1),
+                border: Border.all(color: Colors.green.withOpacity(0.4)),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: const Text(
+                'https://phishguard-ml-backend.onrender.com',
+                style: TextStyle(
+                  color: Colors.green,
+                  fontSize: 13,
+                  fontWeight: FontWeight.w500,
                 ),
               ),
             ),
-            const SizedBox(height: 12),
+            const SizedBox(height: 10),
             Text(
-              'Make sure the FastAPI backend is running.',
-              style: TextStyle(
-                color: Colors.orange[300],
-                fontSize: 12,
-              ),
+              'No configuration needed — always available.',
+              style: TextStyle(color: Colors.blue[200], fontSize: 12),
             ),
           ],
         ),
         actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('Cancel'),
-          ),
           ElevatedButton(
-            onPressed: () async {
-              final newUrl = backendController.text.trim();
-              final prefs = await SharedPreferences.getInstance();
-              await prefs.setString('backend_url', newUrl);
-              setState(() {
-                _backendUrl = newUrl;
-              });
-              if (mounted) {
-                Navigator.pop(context);
-                ScaffoldMessenger.of(context).showSnackBar(
-                  const SnackBar(
-                    content: Text('Backend URL updated'),
-                    backgroundColor: Colors.green,
-                  ),
-                );
-              }
-            },
+            onPressed: () => Navigator.pop(context),
             style: ElevatedButton.styleFrom(
-              backgroundColor: const Color(0xFF4a9eff),
-            ),
-            child: const Text('Save'),
+                backgroundColor: const Color(0xFF4a9eff)),
+            child: const Text('OK'),
           ),
         ],
       ),
