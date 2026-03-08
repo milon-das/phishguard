@@ -1670,8 +1670,8 @@ class _SettingsPageState extends State<SettingsPage> {
   Future<void> _loadBackendUrl() async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      final backendUrl =
-          prefs.getString('backend_url') ?? 'http://localhost:8000';
+      final backendUrl = prefs.getString('backend_url') ??
+          'https://phishguard-ml-backend.onrender.com';
 
       setState(() {
         _backendUrlController.text = backendUrl;
@@ -1805,10 +1805,12 @@ class _SettingsPageState extends State<SettingsPage> {
   Future<void> _resetBackendUrl() async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setString('backend_url', 'http://localhost:8000');
+      await prefs.setString(
+          'backend_url', 'https://phishguard-ml-backend.onrender.com');
 
       setState(() {
-        _backendUrlController.text = 'http://localhost:8000';
+        _backendUrlController.text =
+            'https://phishguard-ml-backend.onrender.com';
         _isBackendUrlConfigured = true;
       });
 
