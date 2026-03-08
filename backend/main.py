@@ -407,6 +407,7 @@ async def check_url(request: URLCheckRequest):
 
 
 @app.get("/health")
+@app.head("/health")
 async def health():
     return {
         "status": "healthy",
