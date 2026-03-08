@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: phishguard-ml-backend
+    env: python
+    region: singapore # or oregon, frankfurt (closest to users)
+    buildCommand: python backend/download_models.py && pip install -r backend/requirements.txt
+    startCommand: cd backend && uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+    healthCheckPath: /health
