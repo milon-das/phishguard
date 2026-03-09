@@ -3119,10 +3119,11 @@ class _CheckURLPageState extends State<CheckURLPage> {
               TextField(
                 controller: _urlController,
                 style: const TextStyle(color: Colors.white),
-                keyboardType: TextInputType
-                    .text, // Use text type to prevent URL auto-correction
-                autocorrect: false, // Disable autocorrect
-                enableSuggestions: false, // Disable suggestions
+                keyboardType: TextInputType.url,
+                autocorrect: false,
+                enableSuggestions: false,
+                smartDashesType: SmartDashesType.disabled,
+                smartQuotesType: SmartQuotesType.disabled,
                 decoration: InputDecoration(
                   hintText: 'https://example.com',
                   hintStyle: TextStyle(color: Colors.white.withOpacity(0.5)),
