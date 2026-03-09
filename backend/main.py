@@ -7,6 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
 import requests
 import os
+import base64
 import joblib
 import scipy.sparse as sp
 from typing import Optional
@@ -125,73 +126,112 @@ def add_request_to_rate_limit():
         rate_limit_requests.append(datetime.now())
 
 
+def _url_to_vt_id(url: str) -> str:
+    """Encode URL to VirusTotal URL ID (base64url, no padding)."""
+    return base64.urlsafe_b64encode(url.encode()).decode().rstrip('=')
+
+
+def _parse_vt_stats(stats: dict, results: dict) -> dict:
+    """Build the standard VT result dict from stats + results dicts."""
+    malicious = stats.get("malicious", 0)
+    suspicious = stats.get("suspicious", 0)
+    harmless = stats.get("harmless", 0)
+    undetected = stats.get("undetected", 0)
+    total = malicious + suspicious + harmless + undetected
+    flagged_vendors = [
+        {"vendor": v, "category": r.get("category"), "result": r.get("result", "malicious")}
+        for v, r in results.items()
+        if r.get("category") in ("malicious", "suspicious")
+    ]
+    return {
+        "malicious": malicious,
+        "suspicious": suspicious,
+        "harmless": harmless,
+        "undetected": undetected,
+        "total": total,
+        "detection_rate": f"{malicious + suspicious}/{total}",
+        "flagged_vendors": flagged_vendors,
+    }
+
+
 def check_virustotal(url: str, api_key: Optional[str] = None):
     """
-    Check URL with VirusTotal API
-    Returns: dict with results, "RATE_LIMITED" string if rate limited, or None if API unavailable/failed
+    Check URL with VirusTotal API.
+
+    Strategy:
+      1. GET /urls/{id}  — look up VT's cached analysis for this URL.
+         This is a single fast request and returns full results immediately
+         for any URL VT has ever analyzed before.
+      2. If 404 (URL unknown to VT), POST /urls to submit for fresh scanning,
+         then wait 5 s and fetch the analysis report.
+
+    Returns: result dict | "RATE_LIMITED" | None
     """
-    # Use provided API key or fall back to environment variable
     vt_key = api_key if api_key else VIRUSTOTAL_API_KEY
-    
     if not vt_key:
         return None
 
     # Only apply the global rate limiter when using the server's own shared key.
-    # Each user supplies their own key, which has its own independent VT quota.
     using_server_key = not api_key
     if using_server_key:
         if check_rate_limit():
             return "RATE_LIMITED"
         add_request_to_rate_limit()
-    
-    headers = {
-        "x-apikey": vt_key,
-        "Content-Type": "application/x-www-form-urlencoded"
-    }
-    
+
+    headers = {"x-apikey": vt_key}
+
     try:
-        # Submit URL for scanning
-        response = requests.post(
-            VIRUSTOTAL_URL_SCAN,
+        # ── Step 1: Cached URL report (fast path) ────────────────────────────
+        url_id = _url_to_vt_id(url)
+        cached = requests.get(
+            f"https://www.virustotal.com/api/v3/urls/{url_id}",
             headers=headers,
-            data={"url": url},
-            timeout=10
+            timeout=10,
         )
-        
-        if response.status_code == 429:
+
+        if cached.status_code == 200:
+            attrs = cached.json().get("data", {}).get("attributes", {})
+            stats = attrs.get("last_analysis_stats", {})
+            results = attrs.get("last_analysis_results", {})
+            data = _parse_vt_stats(stats, results)
+            if data["total"] > 0:
+                return data
+            # total==0 means VT has the URL but no vendors have weighed in yet;
+            # fall through to fresh-scan path below.
+
+        elif cached.status_code == 429:
             return "RATE_LIMITED"
-        elif response.status_code == 200:
-            scan_data = response.json()
-            analysis_id = scan_data.get("data", {}).get("id", "")
+
+        # ── Step 2: Submit for fresh scan (URL unknown to VT / stale cache) ──
+        scan_resp = requests.post(
+            VIRUSTOTAL_URL_SCAN,
+            headers={**headers, "Content-Type": "application/x-www-form-urlencoded"},
+            data={"url": url},
+            timeout=10,
+        )
+
+        if scan_resp.status_code == 429:
+            return "RATE_LIMITED"
+
+        if scan_resp.status_code == 200:
+            analysis_id = scan_resp.json().get("data", {}).get("id", "")
             if analysis_id:
-                report_response = requests.get(
+                import time
+                time.sleep(5)  # give VT time to run initial analysis
+                report = requests.get(
                     VIRUSTOTAL_ANALYSIS_REPORT.format(analysis_id),
                     headers={"x-apikey": vt_key},
-                    timeout=10
+                    timeout=10,
                 )
-                if report_response.status_code == 200:
-                    report_data = report_response.json()
-                    stats = report_data.get("data", {}).get("attributes", {}).get("stats", {})
-                    results = report_data.get("data", {}).get("attributes", {}).get("results", {})
-                    malicious = stats.get("malicious", 0)
-                    suspicious = stats.get("suspicious", 0)
-                    harmless = stats.get("harmless", 0)
-                    undetected = stats.get("undetected", 0)
-                    total = malicious + suspicious + harmless + undetected
-                    flagged_vendors = [
-                        {"vendor": vendor, "category": r.get("category"), "result": r.get("result", "malicious")}
-                        for vendor, r in results.items()
-                        if r.get("category") in ("malicious", "suspicious")
-                    ]
-                    return {
-                        "malicious": malicious,
-                        "suspicious": suspicious,
-                        "harmless": harmless,
-                        "undetected": undetected,
-                        "total": total,
-                        "detection_rate": f"{malicious + suspicious}/{total}",
-                        "flagged_vendors": flagged_vendors,
-                    }
+                if report.status_code == 200:
+                    attrs = report.json().get("data", {}).get("attributes", {})
+                    data = _parse_vt_stats(
+                        attrs.get("stats", {}),
+                        attrs.get("results", {}),
+                    )
+                    if data["total"] > 0:
+                        return data
+
         return None
     except Exception:
         return None
