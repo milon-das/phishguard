@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 from collections import deque
 import threading
 import asyncio
+import time
 
 # url_features.py lives alongside main.py in the backend/ folder
 from url_features import extract_features_batch
@@ -31,7 +32,7 @@ app.add_middleware(
 )
 
 # VirusTotal API Configuration
-VIRUSTOTAL_API_KEY = os.getenv("VIRUSTOTAL_API_KEY", "")
+VIRUSTOTAL_API_KEY = os.getenv("VIRUSTOTAL_API_KEY", "").strip()
 VIRUSTOTAL_URL_SCAN = "https://www.virustotal.com/api/v3/urls"
 VIRUSTOTAL_URL_REPORT = "https://www.virustotal.com/api/v3/urls/{}"
 VIRUSTOTAL_ANALYSIS_REPORT = "https://www.virustotal.com/api/v3/analyses/{}"
@@ -154,88 +155,221 @@ def _parse_vt_stats(stats: dict, results: dict) -> dict:
     }
 
 
+def _log_vt_error_response(stage: str, response: requests.Response) -> None:
+    """Log a VirusTotal error without exposing the API key."""
+    error_code = None
+    error_message = None
+    try:
+        payload = response.json()
+        error_data = payload.get("error", {}) if isinstance(payload, dict) else {}
+        error_code = error_data.get("code")
+        error_message = error_data.get("message")
+    except Exception:
+        pass
+
+    print(
+        f"[VT] {stage} failed | http_status={response.status_code} "
+        f"error_code={error_code or 'unknown'} "
+        f"error_message={error_message or 'unavailable'}",
+        flush=True,
+    )
+
+
 def check_virustotal(url: str, api_key: Optional[str] = None):
     """
     Check URL with VirusTotal API.
 
     Strategy:
-      1. GET /urls/{id}  — look up VT's cached analysis for this URL.
-         This is a single fast request and returns full results immediately
-         for any URL VT has ever analyzed before.
-      2. If 404 (URL unknown to VT), POST /urls to submit for fresh scanning,
-         then wait 5 s and fetch the analysis report.
+      1. GET /urls/{id} to retrieve an existing VirusTotal report.
+      2. Only when the URL is unknown (404), or the existing object has no
+         vendor results, submit it for a fresh scan and check the analysis.
 
     Returns: result dict | "RATE_LIMITED" | None
     """
-    vt_key = api_key if api_key else VIRUSTOTAL_API_KEY
+    app_key = (api_key or "").strip()
+    server_key = VIRUSTOTAL_API_KEY.strip()
+    vt_key = app_key or server_key
+    key_source = "app" if app_key else "render"
+
+    print(
+        f"[VT] Starting URL check | url={url} | "
+        f"key_source={key_source} | key_present={bool(vt_key)} | "
+        f"key_length={len(vt_key)}",
+        flush=True,
+    )
+
     if not vt_key:
+        print("[VT] No VirusTotal API key is available", flush=True)
         return None
 
-    # Only apply the global rate limiter when using the server's own shared key.
-    using_server_key = not api_key
+    # Only apply the in-memory limiter when using the shared Render key.
+    using_server_key = not bool(app_key)
     if using_server_key:
         if check_rate_limit():
+            print(
+                "[VT] Blocked by the backend local 4-requests-per-minute limiter",
+                flush=True,
+            )
             return "RATE_LIMITED"
         add_request_to_rate_limit()
 
     headers = {"x-apikey": vt_key}
 
     try:
-        # ── Step 1: Cached URL report (fast path) ────────────────────────────
+        # Step 1: Existing/cached URL report.
         url_id = _url_to_vt_id(url)
         cached = requests.get(
-            f"https://www.virustotal.com/api/v3/urls/{url_id}",
+            VIRUSTOTAL_URL_REPORT.format(url_id),
             headers=headers,
             timeout=10,
         )
+
+        print(
+            f"[VT] Cached URL lookup | http_status={cached.status_code}",
+            flush=True,
+        )
+
+        should_submit_fresh_scan = False
 
         if cached.status_code == 200:
             attrs = cached.json().get("data", {}).get("attributes", {})
             stats = attrs.get("last_analysis_stats", {})
             results = attrs.get("last_analysis_results", {})
             data = _parse_vt_stats(stats, results)
+
+            print(
+                f"[VT] Existing report parsed | total={data['total']} | "
+                f"malicious={data['malicious']} | suspicious={data['suspicious']} | "
+                f"harmless={data['harmless']} | undetected={data['undetected']}",
+                flush=True,
+            )
+
             if data["total"] > 0:
+                print("[VT] Returning existing VirusTotal report", flush=True)
                 return data
-            # total==0 means VT has the URL but no vendors have weighed in yet;
-            # fall through to fresh-scan path below.
+
+            print(
+                "[VT] Existing URL object has zero vendor results; "
+                "a fresh scan will be submitted",
+                flush=True,
+            )
+            should_submit_fresh_scan = True
+
+        elif cached.status_code == 404:
+            print(
+                "[VT] URL is not present in VirusTotal; "
+                "a fresh scan will be submitted",
+                flush=True,
+            )
+            should_submit_fresh_scan = True
 
         elif cached.status_code == 429:
+            _log_vt_error_response("Cached URL lookup", cached)
             return "RATE_LIMITED"
 
-        # ── Step 2: Submit for fresh scan (URL unknown to VT / stale cache) ──
-        scan_resp = requests.post(
+        else:
+            # Do not submit a new scan after authentication, permission,
+            # server, or malformed-request errors.
+            _log_vt_error_response("Cached URL lookup", cached)
+            return None
+
+        if not should_submit_fresh_scan:
+            return None
+
+        # Step 2: Fresh URL submission.
+        scan_response = requests.post(
             VIRUSTOTAL_URL_SCAN,
-            headers={**headers, "Content-Type": "application/x-www-form-urlencoded"},
+            headers={
+                **headers,
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
             data={"url": url},
             timeout=10,
         )
 
-        if scan_resp.status_code == 429:
+        print(
+            f"[VT] URL submission | http_status={scan_response.status_code}",
+            flush=True,
+        )
+
+        if scan_response.status_code == 429:
+            _log_vt_error_response("URL submission", scan_response)
             return "RATE_LIMITED"
 
-        if scan_resp.status_code == 200:
-            analysis_id = scan_resp.json().get("data", {}).get("id", "")
-            if analysis_id:
-                import time
-                time.sleep(5)  # give VT time to run initial analysis
-                report = requests.get(
-                    VIRUSTOTAL_ANALYSIS_REPORT.format(analysis_id),
-                    headers={"x-apikey": vt_key},
-                    timeout=10,
-                )
-                if report.status_code == 200:
-                    attrs = report.json().get("data", {}).get("attributes", {})
-                    data = _parse_vt_stats(
-                        attrs.get("stats", {}),
-                        attrs.get("results", {}),
-                    )
-                    if data["total"] > 0:
-                        return data
+        if scan_response.status_code not in (200, 201):
+            _log_vt_error_response("URL submission", scan_response)
+            return None
 
-        return None
-    except Exception:
+        analysis_id = scan_response.json().get("data", {}).get("id", "")
+        if not analysis_id:
+            print(
+                "[VT] URL submission succeeded but no analysis ID was returned",
+                flush=True,
+            )
+            return None
+
+        # Preserve the original timing behaviour while diagnosing: wait five
+        # seconds and check once. The logs reveal whether it is still queued.
+        time.sleep(5)
+        report = requests.get(
+            VIRUSTOTAL_ANALYSIS_REPORT.format(analysis_id),
+            headers=headers,
+            timeout=10,
+        )
+
+        print(
+            f"[VT] Analysis lookup | http_status={report.status_code}",
+            flush=True,
+        )
+
+        if report.status_code == 429:
+            _log_vt_error_response("Analysis lookup", report)
+            return "RATE_LIMITED"
+
+        if report.status_code != 200:
+            _log_vt_error_response("Analysis lookup", report)
+            return None
+
+        attrs = report.json().get("data", {}).get("attributes", {})
+        analysis_status = attrs.get("status")
+        data = _parse_vt_stats(
+            attrs.get("stats", {}),
+            attrs.get("results", {}),
+        )
+
+        print(
+            f"[VT] Analysis parsed | status={analysis_status} | "
+            f"total={data['total']} | malicious={data['malicious']} | "
+            f"suspicious={data['suspicious']}",
+            flush=True,
+        )
+
+        if data["total"] > 0:
+            print("[VT] Returning fresh VirusTotal analysis", flush=True)
+            return data
+
+        print(
+            "[VT] Fresh analysis returned no usable vendor results; "
+            "ML fallback will be used",
+            flush=True,
+        )
         return None
 
+    except requests.Timeout as error:
+        print(f"[VT] Request timed out: {error}", flush=True)
+        return None
+    except requests.RequestException as error:
+        print(
+            f"[VT] Network/request error: {type(error).__name__}: {error}",
+            flush=True,
+        )
+        return None
+    except Exception as error:
+        print(
+            f"[VT] Unexpected error: {type(error).__name__}: {error}",
+            flush=True,
+        )
+        return None
 
 def check_ml_model(url: str):
     """
@@ -259,7 +393,11 @@ def check_ml_model(url: str):
             "benign_probability": benign_prob,
             "confidence": max(malicious_prob, benign_prob),
         }
-    except Exception:
+    except Exception as error:
+        print(
+            f"[ML] Prediction failed: {type(error).__name__}: {error}",
+            flush=True,
+        )
         return None
 
 
@@ -381,6 +519,15 @@ async def check_url(request: URLCheckRequest):
     try:
         url = request.url  # already validated and stripped by pydantic
 
+        print(
+            f"[REQUEST] POST /check-url | url={url} | "
+            f"app_key_present={bool(request.vt_api_key)} | "
+            f"app_key_length={len(request.vt_api_key or '')} | "
+            f"render_key_present={bool(VIRUSTOTAL_API_KEY)} | "
+            f"render_key_length={len(VIRUSTOTAL_API_KEY)}",
+            flush=True,
+        )
+
         # Layer 1: VirusTotal Check (PRIMARY)
         # run_in_executor keeps the async event loop unblocked during network I/O
         vt_result = await asyncio.to_thread(check_virustotal, url, request.vt_api_key)
@@ -398,12 +545,28 @@ async def check_url(request: URLCheckRequest):
         )
 
         if should_use_ml:
+            print(
+                f"[REQUEST] VirusTotal unavailable; invoking ML fallback | "
+                f"rate_limited={is_rate_limited}",
+                flush=True,
+            )
             ml_result = await asyncio.to_thread(check_ml_model, url)
             if vt_result and vt_result.get('total', 0) == 0:
                 vt_result = None
+        else:
+            print(
+                "[REQUEST] VirusTotal returned usable results; ML was not called",
+                flush=True,
+            )
 
         # Determine final verdict
         verdict, confidence, method, details = determine_verdict(vt_result, ml_result)
+
+        print(
+            f"[REQUEST] Final result | method={method} | "
+            f"verdict={verdict} | confidence={confidence:.4f}",
+            flush=True,
+        )
 
         return URLCheckResponse(
             url=url,
@@ -424,7 +587,8 @@ async def health():
     return {
         "status": "healthy",
         "ml_model_loaded": ml_model is not None,
-        "vt_api_configured": bool(VIRUSTOTAL_API_KEY)
+        "vt_api_configured": bool(VIRUSTOTAL_API_KEY),
+        "vt_api_key_length": len(VIRUSTOTAL_API_KEY),
     }
 
 
