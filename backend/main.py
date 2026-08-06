@@ -1,397 +1,116 @@
 """
-PhishGuard FastAPI Backend
-Integrates VirusTotal API (primary defense) and ML Model (secondary defense)
+PhishGuard FastAPI Backend - ML fallback only.
+
+VirusTotal URL requests are performed directly by the Flutter application
+using the user's own API key. This Render service performs only the local
+machine-learning fallback when VirusTotal is unavailable or has no usable
+report.
 """
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, field_validator
-import requests
-import os
-import base64
-import joblib
-import scipy.sparse as sp
-from typing import Optional
-from datetime import datetime, timedelta
-from collections import deque
-import threading
 import asyncio
-import time
+import joblib
+import os
+import scipy.sparse as sp
+from typing import Optional, Tuple, Dict
 
-# url_features.py lives alongside main.py in the backend/ folder
 from url_features import extract_features_batch
 
-app = FastAPI(title="PhishGuard API", version="1.0.0", docs_url=None, redoc_url=None, openapi_url=None)
+app = FastAPI(
+    title="PhishGuard ML Fallback API",
+    version="2.0.0",
+    docs_url=None,
+    redoc_url=None,
+    openapi_url=None,
+)
 
-# CORS middleware — restrict to mobile app traffic (no browser origin for mobile apps)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # Mobile apps don't send an Origin header; this is safe
+    allow_origins=["*"],
     allow_credentials=False,
     allow_methods=["GET", "POST", "HEAD"],
     allow_headers=["Content-Type"],
 )
 
-# VirusTotal API Configuration
-VIRUSTOTAL_API_KEY = os.getenv("VIRUSTOTAL_API_KEY", "").strip()
-VIRUSTOTAL_URL_SCAN = "https://www.virustotal.com/api/v3/urls"
-VIRUSTOTAL_URL_REPORT = "https://www.virustotal.com/api/v3/urls/{}"
-VIRUSTOTAL_ANALYSIS_REPORT = "https://www.virustotal.com/api/v3/analyses/{}"
+MODEL_DIR = os.path.join(os.path.dirname(__file__), "models")
+char_tfidf = joblib.load(
+    os.path.join(MODEL_DIR, "PhiUSIIL_Phishing_URL_Dataset_char_tfidf.pkl")
+)
+word_tfidf = joblib.load(
+    os.path.join(MODEL_DIR, "PhiUSIIL_Phishing_URL_Dataset_word_tfidf.pkl")
+)
+ml_model = joblib.load(
+    os.path.join(MODEL_DIR, "PhiUSIIL_Phishing_URL_Dataset_rf.pkl")
+)
 
-# Rate Limit Tracking (VirusTotal free tier: 4 requests per minute)
-_rate_limit_lock = threading.Lock()
-rate_limit_requests = deque()  # Store timestamps of requests
-RATE_LIMIT_MAX = 4  # Max requests per minute
-RATE_LIMIT_WINDOW = 60  # Time window in seconds
-rate_limit_reset_time = None  # When the rate limit will reset
-
-# Load ML Models - Using PhiUSIIL (best performance: 99.78% accuracy, 0.44% false positive rate)
-MODEL_DIR = os.path.join(os.path.dirname(__file__), 'models')
-char_tfidf = joblib.load(os.path.join(MODEL_DIR, "PhiUSIIL_Phishing_URL_Dataset_char_tfidf.pkl"))
-word_tfidf = joblib.load(os.path.join(MODEL_DIR, "PhiUSIIL_Phishing_URL_Dataset_word_tfidf.pkl"))
-ml_model = joblib.load(os.path.join(MODEL_DIR, "PhiUSIIL_Phishing_URL_Dataset_rf.pkl"))
-
-print("=" * 80)
-print("PhishGuard Backend - ML Model Loaded")
-print("=" * 80)
-print(f"Model: PhiUSIIL Phishing URL Dataset")
-print(f"Performance: 99.78% accuracy, 0.44% false positive rate")
-print(f"Training: 235,370 URLs (134,850 malicious, 100,520 benign)")
-print("=" * 80)
-
-# Concurrency guard
-# Render free tier: 512 MB RAM. After model load (~200 MB), each request
-# uses ~20-30 MB. Cap at 8 concurrent to stay safely under memory limit.
-_active_requests: int = 0
-_MAX_CONCURRENT: int = 8
-
+print("=" * 80, flush=True)
+print("PhishGuard ML fallback backend loaded", flush=True)
+print("Model: PhiUSIIL Random Forest", flush=True)
+print("Mode: ML fallback only; VirusTotal is called directly by Flutter", flush=True)
+print("Training set: 235,370 unique URLs", flush=True)
+print("=" * 80, flush=True)
 
 MAX_URL_LENGTH = 2048
-VT_API_KEY_PATTERN_LEN = 64  # VT keys are exactly 64 hex chars
+_MAX_CONCURRENT = 8
+_active_requests = 0
 
 
 class URLCheckRequest(BaseModel):
     url: str
-    vt_api_key: Optional[str] = None
 
-    @field_validator('url')
+    @field_validator("url")
     @classmethod
-    def validate_url(cls, v: str) -> str:
-        v = v.strip()
-        if not v:
-            raise ValueError('URL is required')
-        if len(v) > MAX_URL_LENGTH:
-            raise ValueError(f'URL exceeds maximum length of {MAX_URL_LENGTH} characters')
-        if not (v.startswith('http://') or v.startswith('https://')):
-            raise ValueError('URL must start with http:// or https://')
-        return v
-
-    @field_validator('vt_api_key')
-    @classmethod
-    def validate_vt_key(cls, v: Optional[str]) -> Optional[str]:
-        if v is None or v.strip() == '':
-            return None
-        v = v.strip()
-        if len(v) != VT_API_KEY_PATTERN_LEN or not v.isalnum():
-            raise ValueError('Invalid VirusTotal API key format')
-        return v
+    def validate_url(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("URL is required")
+        if len(normalized) > MAX_URL_LENGTH:
+            raise ValueError(
+                f"URL exceeds maximum length of {MAX_URL_LENGTH} characters"
+            )
+        if not (
+            normalized.startswith("http://")
+            or normalized.startswith("https://")
+        ):
+            raise ValueError("URL must start with http:// or https://")
+        return normalized
 
 
 class URLCheckResponse(BaseModel):
     url: str
-    verdict: str  # "Safe", "Suspicious", "Malicious"
-    confidence: float  # 0.0 to 1.0
-    vt_result: Optional[dict]
+    verdict: str
+    confidence: float
+    vt_result: Optional[dict] = None
     ml_result: Optional[dict]
-    method_used: str  # "VirusTotal", "ML Model", "Combined"
+    method_used: str
     details: str
 
 
-def check_rate_limit():
-    """Check if rate limit is exceeded and clean old requests (thread-safe)"""
-    global rate_limit_reset_time
-    now = datetime.now()
-    with _rate_limit_lock:
-        while rate_limit_requests and (now - rate_limit_requests[0]) > timedelta(seconds=RATE_LIMIT_WINDOW):
-            rate_limit_requests.popleft()
-        if len(rate_limit_requests) >= RATE_LIMIT_MAX:
-            if rate_limit_requests:
-                rate_limit_reset_time = rate_limit_requests[0] + timedelta(seconds=RATE_LIMIT_WINDOW)
-            return True
-        rate_limit_reset_time = None
-        return False
-
-
-def add_request_to_rate_limit():
-    """Record a new request timestamp (thread-safe)"""
-    with _rate_limit_lock:
-        rate_limit_requests.append(datetime.now())
-
-
-def _url_to_vt_id(url: str) -> str:
-    """Encode URL to VirusTotal URL ID (base64url, no padding)."""
-    return base64.urlsafe_b64encode(url.encode()).decode().rstrip('=')
-
-
-def _parse_vt_stats(stats: dict, results: dict) -> dict:
-    """Build the standard VT result dict from stats + results dicts."""
-    malicious = stats.get("malicious", 0)
-    suspicious = stats.get("suspicious", 0)
-    harmless = stats.get("harmless", 0)
-    undetected = stats.get("undetected", 0)
-    total = malicious + suspicious + harmless + undetected
-    flagged_vendors = [
-        {"vendor": v, "category": r.get("category"), "result": r.get("result", "malicious")}
-        for v, r in results.items()
-        if r.get("category") in ("malicious", "suspicious")
-    ]
-    return {
-        "malicious": malicious,
-        "suspicious": suspicious,
-        "harmless": harmless,
-        "undetected": undetected,
-        "total": total,
-        "detection_rate": f"{malicious + suspicious}/{total}",
-        "flagged_vendors": flagged_vendors,
-    }
-
-
-def _log_vt_error_response(stage: str, response: requests.Response) -> None:
-    """Log a VirusTotal error without exposing the API key."""
-    error_code = None
-    error_message = None
+def check_ml_model(url: str) -> Optional[Dict]:
+    """Run the trained URL classifier and return class probabilities."""
     try:
-        payload = response.json()
-        error_data = payload.get("error", {}) if isinstance(payload, dict) else {}
-        error_code = error_data.get("code")
-        error_message = error_data.get("message")
-    except Exception:
-        pass
-
-    print(
-        f"[VT] {stage} failed | http_status={response.status_code} "
-        f"error_code={error_code or 'unknown'} "
-        f"error_message={error_message or 'unavailable'}",
-        flush=True,
-    )
-
-
-def check_virustotal(url: str, api_key: Optional[str] = None):
-    """
-    Check URL with VirusTotal API.
-
-    Strategy:
-      1. GET /urls/{id} to retrieve an existing VirusTotal report.
-      2. Only when the URL is unknown (404), or the existing object has no
-         vendor results, submit it for a fresh scan and check the analysis.
-
-    Returns: result dict | "RATE_LIMITED" | None
-    """
-    app_key = (api_key or "").strip()
-    server_key = VIRUSTOTAL_API_KEY.strip()
-    vt_key = app_key or server_key
-    key_source = "app" if app_key else "render"
-
-    print(
-        f"[VT] Starting URL check | url={url} | "
-        f"key_source={key_source} | key_present={bool(vt_key)} | "
-        f"key_length={len(vt_key)}",
-        flush=True,
-    )
-
-    if not vt_key:
-        print("[VT] No VirusTotal API key is available", flush=True)
-        return None
-
-    # Only apply the in-memory limiter when using the shared Render key.
-    using_server_key = not bool(app_key)
-    if using_server_key:
-        if check_rate_limit():
-            print(
-                "[VT] Blocked by the backend local 4-requests-per-minute limiter",
-                flush=True,
-            )
-            return "RATE_LIMITED"
-        add_request_to_rate_limit()
-
-    headers = {"x-apikey": vt_key}
-
-    try:
-        # Step 1: Existing/cached URL report.
-        url_id = _url_to_vt_id(url)
-        cached = requests.get(
-            VIRUSTOTAL_URL_REPORT.format(url_id),
-            headers=headers,
-            timeout=10,
+        normalized_url = url.strip().lower()
+        lexical_features = extract_features_batch([normalized_url])
+        character_features = char_tfidf.transform([normalized_url])
+        word_features = word_tfidf.transform([normalized_url])
+        numeric_features = sp.csr_matrix(lexical_features)
+        feature_matrix = sp.hstack(
+            [character_features, word_features, numeric_features]
         )
 
-        print(
-            f"[VT] Cached URL lookup | http_status={cached.status_code}",
-            flush=True,
-        )
+        prediction = ml_model.predict(feature_matrix)[0]
+        probabilities = ml_model.predict_proba(feature_matrix)[0]
 
-        should_submit_fresh_scan = False
+        malicious_probability = float(probabilities[1])
+        benign_probability = float(probabilities[0])
 
-        if cached.status_code == 200:
-            attrs = cached.json().get("data", {}).get("attributes", {})
-            stats = attrs.get("last_analysis_stats", {})
-            results = attrs.get("last_analysis_results", {})
-            data = _parse_vt_stats(stats, results)
-
-            print(
-                f"[VT] Existing report parsed | total={data['total']} | "
-                f"malicious={data['malicious']} | suspicious={data['suspicious']} | "
-                f"harmless={data['harmless']} | undetected={data['undetected']}",
-                flush=True,
-            )
-
-            if data["total"] > 0:
-                print("[VT] Returning existing VirusTotal report", flush=True)
-                return data
-
-            print(
-                "[VT] Existing URL object has zero vendor results; "
-                "a fresh scan will be submitted",
-                flush=True,
-            )
-            should_submit_fresh_scan = True
-
-        elif cached.status_code == 404:
-            print(
-                "[VT] URL is not present in VirusTotal; "
-                "a fresh scan will be submitted",
-                flush=True,
-            )
-            should_submit_fresh_scan = True
-
-        elif cached.status_code == 429:
-            _log_vt_error_response("Cached URL lookup", cached)
-            return "RATE_LIMITED"
-
-        else:
-            # Do not submit a new scan after authentication, permission,
-            # server, or malformed-request errors.
-            _log_vt_error_response("Cached URL lookup", cached)
-            return None
-
-        if not should_submit_fresh_scan:
-            return None
-
-        # Step 2: Fresh URL submission.
-        scan_response = requests.post(
-            VIRUSTOTAL_URL_SCAN,
-            headers={
-                **headers,
-                "Content-Type": "application/x-www-form-urlencoded",
-            },
-            data={"url": url},
-            timeout=10,
-        )
-
-        print(
-            f"[VT] URL submission | http_status={scan_response.status_code}",
-            flush=True,
-        )
-
-        if scan_response.status_code == 429:
-            _log_vt_error_response("URL submission", scan_response)
-            return "RATE_LIMITED"
-
-        if scan_response.status_code not in (200, 201):
-            _log_vt_error_response("URL submission", scan_response)
-            return None
-
-        analysis_id = scan_response.json().get("data", {}).get("id", "")
-        if not analysis_id:
-            print(
-                "[VT] URL submission succeeded but no analysis ID was returned",
-                flush=True,
-            )
-            return None
-
-        # Preserve the original timing behaviour while diagnosing: wait five
-        # seconds and check once. The logs reveal whether it is still queued.
-        time.sleep(5)
-        report = requests.get(
-            VIRUSTOTAL_ANALYSIS_REPORT.format(analysis_id),
-            headers=headers,
-            timeout=10,
-        )
-
-        print(
-            f"[VT] Analysis lookup | http_status={report.status_code}",
-            flush=True,
-        )
-
-        if report.status_code == 429:
-            _log_vt_error_response("Analysis lookup", report)
-            return "RATE_LIMITED"
-
-        if report.status_code != 200:
-            _log_vt_error_response("Analysis lookup", report)
-            return None
-
-        attrs = report.json().get("data", {}).get("attributes", {})
-        analysis_status = attrs.get("status")
-        data = _parse_vt_stats(
-            attrs.get("stats", {}),
-            attrs.get("results", {}),
-        )
-
-        print(
-            f"[VT] Analysis parsed | status={analysis_status} | "
-            f"total={data['total']} | malicious={data['malicious']} | "
-            f"suspicious={data['suspicious']}",
-            flush=True,
-        )
-
-        if data["total"] > 0:
-            print("[VT] Returning fresh VirusTotal analysis", flush=True)
-            return data
-
-        print(
-            "[VT] Fresh analysis returned no usable vendor results; "
-            "ML fallback will be used",
-            flush=True,
-        )
-        return None
-
-    except requests.Timeout as error:
-        print(f"[VT] Request timed out: {error}", flush=True)
-        return None
-    except requests.RequestException as error:
-        print(
-            f"[VT] Network/request error: {type(error).__name__}: {error}",
-            flush=True,
-        )
-        return None
-    except Exception as error:
-        print(
-            f"[VT] Unexpected error: {type(error).__name__}: {error}",
-            flush=True,
-        )
-        return None
-
-def check_ml_model(url: str):
-    """
-    Check URL with ML Model
-    Returns: dict with prediction and probability
-    """
-    try:
-        url_lower = url.strip().lower()
-        features = extract_features_batch([url_lower])
-        x_char = char_tfidf.transform([url_lower])
-        x_word = word_tfidf.transform([url_lower])
-        x_feat = sp.csr_matrix(features)
-        x = sp.hstack([x_char, x_word, x_feat])
-        pred = ml_model.predict(x)[0]
-        prob = ml_model.predict_proba(x)[0]
-        malicious_prob = float(prob[1])
-        benign_prob = float(prob[0])
         return {
-            "prediction": "Malicious" if pred == 1 else "Benign",
-            "malicious_probability": malicious_prob,
-            "benign_probability": benign_prob,
-            "confidence": max(malicious_prob, benign_prob),
+            "prediction": "Malicious" if prediction == 1 else "Benign",
+            "malicious_probability": malicious_probability,
+            "benign_probability": benign_probability,
+            "confidence": max(malicious_probability, benign_probability),
         }
     except Exception as error:
         print(
@@ -401,180 +120,83 @@ def check_ml_model(url: str):
         return None
 
 
-def determine_verdict(vt_result, ml_result):
-    """
-    Simplified verdict logic - NO mixing of VT and ML decisions
-    
-    Priority 1: If VirusTotal has results, use VT ONLY
-      - Any flags (1+): Suspicious or Malicious based on count
-      - No flags: Safe
-    
-    Priority 2: If VT unavailable, use ML Model ONLY
-      - High probability: Malicious
-      - Medium probability: Suspicious  
-      - Low probability: Safe
-    """
-    verdict = "Unknown"
-    confidence = 0.0
-    method = "Unknown"
-    details = ""
-    
-    # PRIORITY 1: VirusTotal (if available AND has actual results, use VT ONLY - ignore ML)
-    if vt_result:
-        malicious = vt_result.get("malicious", 0)
-        suspicious = vt_result.get("suspicious", 0)
-        total = vt_result.get("total", 0)
-        flagged = malicious + suspicious
-        
-        # If no vendors analyzed it (not in VT database), treat as VT unavailable - fall back to ML
-        if total == 0:
-            pass  # Skip VT, fall through to ML check below
-        
-        # If 3+ vendors flagged: MALICIOUS
-        elif flagged >= 3:
-            verdict = "Malicious"
-            confidence = 1.0  # VT gives definitive answers
-            method = "VirusTotal"
-            details = f"{flagged} out of {total} security vendors flagged this URL."
-            return verdict, confidence, method, details
-        
-        # If 1-2 vendors flagged: SUSPICIOUS
-        elif flagged >= 1:
-            verdict = "Suspicious"
-            confidence = 1.0  # VT gives definitive answers
-            method = "VirusTotal"
-            details = f"{flagged} out of {total} security vendors flagged this URL."
-            return verdict, confidence, method, details
-        
-        # If 0 vendors flagged: SAFE
-        elif total > 0:
-            verdict = "Safe"
-            confidence = 1.0  # VT gives definitive answers
-            method = "VirusTotal"
-            details = f"No threats detected by {total} security vendors."
-            return verdict, confidence, method, details
-    
-    # PRIORITY 2: ML Model (used if VT unavailable or returned 0/0)
-    if ml_result:
-        ml_prob = ml_result.get("malicious_probability", 0)
-        
-        # High risk: MALICIOUS
-        if ml_prob > 0.7:
-            verdict = "Malicious"
-            confidence = ml_prob
-            method = "ML Model"
-            details = f"ML model detected high-risk patterns with {ml_prob:.1%} confidence."
-        
-        # Medium risk: SUSPICIOUS
-        elif ml_prob > 0.5:
-            verdict = "Suspicious"
-            confidence = ml_prob
-            method = "ML Model"
-            details = f"ML model detected suspicious patterns with {ml_prob:.1%} confidence."
-        
-        # Low risk: SAFE
-        else:
-            verdict = "Safe"
-            confidence = 1.0 - ml_prob
-            method = "ML Model"
-            details = f"ML model found no significant threats (malicious probability: {ml_prob:.1%})."
-    
-    # Neither VT nor ML available
-    else:
-        verdict = "Unknown"
-        confidence = 0.0
-        method = "None"
-        details = "Unable to analyze URL. Both VirusTotal API and ML model unavailable."
-    
-    return verdict, confidence, method, details
+def determine_ml_verdict(ml_result: Optional[Dict]) -> Tuple[str, float, str]:
+    if ml_result is None:
+        return (
+            "Unknown",
+            0.0,
+            "The ML fallback could not analyze this URL.",
+        )
+
+    malicious_probability = ml_result.get("malicious_probability", 0.0)
+
+    if malicious_probability > 0.70:
+        return (
+            "Malicious",
+            malicious_probability,
+            "The ML model detected high-risk URL patterns "
+            f"with a malicious probability of {malicious_probability:.1%}.",
+        )
+
+    if malicious_probability > 0.50:
+        return (
+            "Suspicious",
+            malicious_probability,
+            "The ML model detected suspicious URL patterns "
+            f"with a malicious probability of {malicious_probability:.1%}.",
+        )
+
+    return (
+        "Safe",
+        1.0 - malicious_probability,
+        "The ML model found a low malicious-pattern probability "
+        f"of {malicious_probability:.1%}.",
+    )
 
 
 @app.get("/")
 async def root():
-    return {"service": "PhishGuard API", "status": "running"}
+    return {
+        "service": "PhishGuard ML Fallback API",
+        "status": "running",
+        "mode": "ml_fallback_only",
+    }
 
 
 @app.post("/check-url", response_model=URLCheckResponse)
 async def check_url(request: URLCheckRequest):
-    """
-    Check URL using two-layer defense:
-    1. VirusTotal API (primary)
-    2. ML Model (secondary/fallback)
-
-    Blocking I/O and CPU work are offloaded to threads so the event loop
-    stays responsive under concurrent load. A concurrency cap protects
-    against OOM on the Render free tier (512 MB RAM).
-    """
     global _active_requests
 
-    # Shed excess load before we exhaust memory
     if _active_requests >= _MAX_CONCURRENT:
         raise HTTPException(
             status_code=503,
             detail="Server is busy. Please retry in a few seconds.",
             headers={"Retry-After": "10"},
         )
+
     _active_requests += 1
-
     try:
-        url = request.url  # already validated and stripped by pydantic
-
         print(
-            f"[REQUEST] POST /check-url | url={url} | "
-            f"app_key_present={bool(request.vt_api_key)} | "
-            f"app_key_length={len(request.vt_api_key or '')} | "
-            f"render_key_present={bool(VIRUSTOTAL_API_KEY)} | "
-            f"render_key_length={len(VIRUSTOTAL_API_KEY)}",
+            f"[REQUEST] POST /check-url | url={request.url} | mode=ml_only",
             flush=True,
         )
 
-        # Layer 1: VirusTotal Check (PRIMARY)
-        # run_in_executor keeps the async event loop unblocked during network I/O
-        vt_result = await asyncio.to_thread(check_virustotal, url, request.vt_api_key)
-
-        is_rate_limited = (vt_result == "RATE_LIMITED")
-        if is_rate_limited:
-            vt_result = None
-
-        # Layer 2: ML Model Check (fallback)
-        # asyncio.to_thread also prevents CPU-bound inference from stalling other requests
-        ml_result = None
-        should_use_ml = (
-            vt_result is None or
-            (isinstance(vt_result, dict) and vt_result.get('total', 0) == 0)
-        )
-
-        if should_use_ml:
-            print(
-                f"[REQUEST] VirusTotal unavailable; invoking ML fallback | "
-                f"rate_limited={is_rate_limited}",
-                flush=True,
-            )
-            ml_result = await asyncio.to_thread(check_ml_model, url)
-            if vt_result and vt_result.get('total', 0) == 0:
-                vt_result = None
-        else:
-            print(
-                "[REQUEST] VirusTotal returned usable results; ML was not called",
-                flush=True,
-            )
-
-        # Determine final verdict
-        verdict, confidence, method, details = determine_verdict(vt_result, ml_result)
+        ml_result = await asyncio.to_thread(check_ml_model, request.url)
+        verdict, confidence, details = determine_ml_verdict(ml_result)
 
         print(
-            f"[REQUEST] Final result | method={method} | "
+            f"[REQUEST] Final result | method=ML Model | "
             f"verdict={verdict} | confidence={confidence:.4f}",
             flush=True,
         )
 
         return URLCheckResponse(
-            url=url,
+            url=request.url,
             verdict=verdict,
             confidence=confidence,
-            vt_result=vt_result,
+            vt_result=None,
             ml_result=ml_result,
-            method_used=method,
+            method_used="ML Model",
             details=details,
         )
     finally:
@@ -587,12 +209,12 @@ async def health():
     return {
         "status": "healthy",
         "ml_model_loaded": ml_model is not None,
-        "vt_api_configured": bool(VIRUSTOTAL_API_KEY),
-        "vt_api_key_length": len(VIRUSTOTAL_API_KEY),
+        "mode": "ml_fallback_only",
+        "virus_total_handled_by": "flutter_client",
     }
-
 
 
 if __name__ == "__main__":
     import uvicorn
+
     uvicorn.run(app, host="0.0.0.0", port=8000)
